@@ -2908,6 +2908,15 @@ First row: ${firstRowStr}`;
 
         // exact same request body, matching the original benchmark behavior.
 
+        function getApiRequestUrl(endpoint) {
+            const isLocalServer = window.location.protocol === 'http:' &&
+                (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+            if (isLocalServer && /^https?:\/\//i.test(endpoint)) {
+                return `/api_proxy?url=${encodeURIComponent(endpoint)}`;
+            }
+            return endpoint;
+        }
+
         async function callLLM(endpoint, apiKey, model, systemPrompt, messages, maxTokens, temperature, cacheSalt, signal, onCallAttempt, onTokenUsage) {
 
             const formattedMessages = [{ role: "system", content: systemPrompt }];
@@ -3012,7 +3021,7 @@ First row: ${firstRowStr}`;
 
 
 
-                const response = await fetch(endpoint, {
+                const response = await fetch(getApiRequestUrl(endpoint), {
 
                     method: "POST",
 
@@ -4709,7 +4718,7 @@ function renderRoundMatrix() {
 
 
 
-                const response = await fetch(modelsUrl, {
+                const response = await fetch(getApiRequestUrl(modelsUrl), {
 
                     method: 'GET',
 

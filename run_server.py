@@ -8,6 +8,9 @@ import sys
 import os
 import json
 import csv
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime
 
 PORT = 8000
@@ -28,7 +31,60 @@ class CORSHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
 
+    def _proxy_request(self):
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        target_urls = query.get('url', [])
+        if len(target_urls) != 1 or urllib.parse.urlsplit(target_urls[0]).scheme not in ('http', 'https'):
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'Missing or invalid proxy URL')
+            return
+
+        target_url = target_urls[0]
+        headers = {
+            key: value for key, value in self.headers.items()
+            if key.lower() not in ('host', 'origin', 'referer', 'content-length', 'accept-encoding')
+        }
+        body = None
+        if self.command == 'POST':
+            content_length = int(self.headers.get('Content-Length', '0'))
+            body = self.rfile.read(content_length)
+
+        try:
+            request = urllib.request.Request(target_url, data=body, headers=headers, method=self.command)
+            with urllib.request.urlopen(request, timeout=120) as response:
+                response_body = response.read()
+                self.send_response(response.status)
+                content_type = response.headers.get('Content-Type')
+                if content_type:
+                    self.send_header('Content-Type', content_type)
+                self.send_header('Content-Length', str(len(response_body)))
+                self.end_headers()
+                self.wfile.write(response_body)
+        except urllib.error.HTTPError as error:
+            response_body = error.read()
+            self.send_response(error.code)
+            self.send_header('Content-Type', error.headers.get('Content-Type', 'text/plain'))
+            self.send_header('Content-Length', str(len(response_body)))
+            self.end_headers()
+            self.wfile.write(response_body)
+        except Exception as error:
+            self.send_response(502)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': str(error)}).encode('utf-8'))
+
+    def do_GET(self):
+        if self.path.partition('?')[0] == '/api_proxy':
+            self._proxy_request()
+            return
+        super().do_GET()
+
     def do_POST(self):
+        if self.path.partition('?')[0] == '/api_proxy':
+            self._proxy_request()
+            return
+
         content_length = int(self.headers['Content-Length'])
         post_data = self.rfile.read(content_length)
         
