@@ -1612,7 +1612,7 @@
 
             <li>点击密钥输入框右侧的<strong>刷新按钮</strong>，在下拉菜单中<strong>选择测试模型</strong>；</li>
 
-            <li>在参数配置中填写您希望测试的<strong>测试轮数 (Rounds)</strong>，然后点击 <strong>开始测试</strong> 即可；</li>
+            <li>在参数配置中填写您希望测试的<strong>测试轮数 (Rounds)</strong>，系统将以<strong>并发模式</strong>同时向 LLM 发起 N 轮测试（并发数 = 测试轮数，轮内逐题串行），然后点击 <strong>开始测试</strong> 即可；</li>
 
             <li><strong>Max Tokens / Temperature / 单个测试超时 / 最大重试次数</strong> 均无须修改，系统已预设与官方默认规则保持一致；</li>
 
@@ -1680,9 +1680,9 @@
 
             <div class="input-group">
 
-                <label>测试轮数 (Rounds)</label>
+                <label>测试轮数 (Rounds · 即并发数)</label>
 
-                <input type="number" id="api-rounds" value="1" min="1" max="100">
+                <input type="number" id="api-rounds" value="1" min="1" max="100" title="填写的轮数即为对 LLM 的并发请求流数：N 轮会同时并发开跑，轮内题目仍逐题串行">
 
             </div>
 
@@ -1844,7 +1844,7 @@
 
         <div class="stat-card" style="border-color: rgba(59, 130, 246, 0.4);">
 
-            <span class="stat-label" style="color: var(--info);">当前轮次</span>
+            <span class="stat-label" style="color: var(--info);">并发轮次</span>
 
             <span id="stat-round" class="stat-val" style="color: var(--info);">第 1 / 1 轮</span>
 
@@ -2255,9 +2255,13 @@
 
         let benchmarkPaused = false;
 
-        let currentQuestionIndex = 0;
+        let currentQuestionIndex = 0; // Unused since concurrent rounds; each round state tracks its own index
 
-        let runResults = {}; // Map of questionId -> result object
+        // Concurrent mode: every round runs as its own worker stream. While a round is
+        // still running its live state lives in roundStates keyed by round number:
+        //   { roundNum, results: {qid -> result obj}, startTime, pausedTotalMs, currentIndex, done }
+        // Finished (or stopped-mid) rounds are archived into multiRoundMatrix below.
+        let roundStates = {};
 
         let selectedQuestionId = null;
 
@@ -2267,13 +2271,13 @@
 
         let abortController = null;
 
+        // currentRoundNum now means "the round the inspector is focused on" (default 1),
+        // not "the only round that may be running". Rendering must never depend on it.
         let currentRoundNum = 1;
 
-        let currentRoundStartTime = 0;
-
-        let totalPausedMs = 0;
-
-        let roundPausedStartTime = 0;
+        // Pause bookkeeping is global: the pause button records globalPauseStart and, on
+        // resume, credits every still-live round with the paused wall time.
+        let globalPauseStart = 0;
 
         let inspectorExpanded = false;
         let autoScrollInspector = true;
@@ -2281,6 +2285,129 @@
         let multiRoundMatrix = [];
 
         let timerWorker = null; // Array of round records
+
+        // ---- Concurrent-round state helpers -------------------------------------
+
+        function getLiveRoundState(roundNum) {
+            const state = roundStates[roundNum];
+            return state && !state.done ? state : null;
+        }
+
+        function getArchivedRound(roundNum) {
+            return multiRoundMatrix.find(item => item.roundNum === roundNum) || null;
+        }
+
+        function isRoundStarted(roundNum) {
+            return Boolean(roundStates[roundNum] || getArchivedRound(roundNum));
+        }
+
+        // Per-round live status map for a question, regardless of running order.
+        function getRoundQuestionStatus(roundNum, qId) {
+            if (!selectedQuestionIds.has(qId)) return 'skipped';
+            const live = getLiveRoundState(roundNum);
+            if (live) {
+                const res = live.results[qId];
+                return res ? res.status : 'pending';
+            }
+            const archived = getArchivedRound(roundNum);
+            if (archived && archived.results) {
+                return archived.results[qId] || 'pending';
+            }
+            return 'pending';
+        }
+
+        function getRoundQuestionElapsed(roundNum, qId) {
+            const live = getLiveRoundState(roundNum);
+            if (live && live.results[qId]) return live.results[qId].elapsed;
+            const archived = getArchivedRound(roundNum);
+            if (archived && archived.details && archived.details[qId]) return archived.details[qId].elapsed;
+            return null;
+        }
+
+        function getRoundDurationMs(roundNum) {
+            const live = getLiveRoundState(roundNum);
+            if (live) {
+                let paused = live.pausedTotalMs;
+                if (benchmarkPaused && globalPauseStart > 0) {
+                    paused += (performance.now() - globalPauseStart);
+                }
+                return Math.max(0, performance.now() - live.startTime - paused);
+            }
+            const archived = getArchivedRound(roundNum);
+            return archived ? (archived.totalDurationMs || 0) : 0;
+        }
+
+        // Aggregate badge for the question list card while rounds run concurrently:
+        // running wins; otherwise the terminal status of the highest round that has
+        // finished this question; otherwise pending.
+        function aggregateQuestionStatus(qId, totalRounds) {
+            if (!selectedQuestionIds.has(qId)) return 'skipped';
+            const maxR = totalRounds || parseInt(document.getElementById('api-rounds').value.trim(), 10) || 1;
+            let latestTerminal = null;
+            for (let r = 1; r <= maxR; r++) {
+                const status = getRoundQuestionStatus(r, qId);
+                if (status === 'running') return 'running';
+                if (status === 'pass' || status === 'fail' || status === 'error') {
+                    latestTerminal = status;
+                }
+            }
+            return latestTerminal || 'pending';
+        }
+
+        function refreshQuestionCard(qId) {
+            updateQuestionCardStatus(qId, aggregateQuestionStatus(qId));
+        }
+
+        function refreshAllQuestionCards() {
+            questionsList.forEach(q => refreshQuestionCard(q.id));
+        }
+
+        // Collect every question-run across live + archived rounds: used by stats and
+        // the global progress readout.
+        function forEachCompletedRun(callback) {
+            Object.keys(roundStates).forEach(key => {
+                const state = roundStates[key];
+                Object.values(state.results).forEach(callback);
+            });
+            multiRoundMatrix.forEach(round => {
+                if (!round.results) return;
+                Object.keys(round.results).forEach(qId => {
+                    const status = round.results[qId];
+                    const detail = (round.details && round.details[qId]) || null;
+                    if (detail) {
+                        callback(detail);
+                    } else {
+                        callback({ status });
+                    }
+                });
+            });
+        }
+
+        function countLiveRounds() {
+            return Object.keys(roundStates).filter(r => !roundStates[r].done).length;
+        }
+
+        // Credit the pending pause window (globalPauseStart -> now) to every round
+        // that is still live. Called when the user resumes or stops the benchmark.
+        function creditPauseToLiveRounds() {
+            if (globalPauseStart > 0) {
+                const pausedSpan = performance.now() - globalPauseStart;
+                Object.keys(roundStates).forEach(key => {
+                    const state = roundStates[key];
+                    if (!state.done) state.pausedTotalMs += pausedSpan;
+                });
+                globalPauseStart = 0;
+            }
+        }
+
+        // Auto-follow target: the lowest-numbered round that is still live.
+        function getFollowRound() {
+            const liveRounds = Object.keys(roundStates)
+                .map(Number)
+                .filter(r => !roundStates[r].done)
+                .sort((a, b) => a - b);
+            return liveRounds.length > 0 ? liveRounds[0] : null;
+        }
 
         function getLocalTimestamp() {
 
@@ -3528,9 +3655,13 @@ First row: ${firstRowStr}`;
 
         // Save Trace to server as local CSV
 
-        async function saveTraceToServer(isManual = false, roundNum = null, totalRounds = null) {
+        async function saveTraceToServer(isManual = false, roundNum = null, totalRounds = null, roundResultsObj = null) {
 
-            const results = Object.values(runResults);
+            // In concurrent mode several rounds finish out of order, so the caller passes
+            // the finished round's own results map. Fall back to the focused live round.
+            const results = roundResultsObj
+                ? Object.values(roundResultsObj)
+                : Object.values((getLiveRoundState(selectedRoundNum || 1) || {}).results || {});
 
             if (results.length === 0) {
 
@@ -3790,7 +3921,7 @@ First row: ${firstRowStr}`;
 
             multiRoundMatrix.forEach((round, rIdx) => {
 
-                const roundNum = rIdx + 1;
+                const roundNum = round.roundNum || (rIdx + 1);
 
                 let roundPass = 0;
 
@@ -4298,37 +4429,19 @@ function renderRoundMatrix() {
 
                 let roundDuration = 0;
 
-                if (r === currentRoundNum) {
+                if (isRoundStarted(r)) {
 
-                    if (benchmarkRunning && currentRoundStartTime > 0) {
-
-                        let activePaused = totalPausedMs;
-
-                        if (benchmarkPaused && roundPausedStartTime > 0) {
-
-                            activePaused += (performance.now() - roundPausedStartTime);
-
-                        }
-
-                        roundDuration = performance.now() - currentRoundStartTime - activePaused;
-
-                    }
-
-                } else if (r < currentRoundNum) {
-
-                    const rData = multiRoundMatrix.find(item => item.roundNum === r);
-
-                    if (rData) {
-
-                        roundDuration = rData.totalDurationMs || 0;
-
-                    }
+                    roundDuration = getRoundDurationMs(r);
 
                 }
 
+                const liveState = getLiveRoundState(r);
+
+                const liveTag = liveState ? ' · 并发中' : '';
+
                 const timeStr = roundDuration > 0 ? `(${(roundDuration/1000).toFixed(0)}s)` : '';
 
-                tr.innerHTML = `<td style="font-weight: bold; font-size: 12.5px; color: var(--text-color); padding-right: 12px; white-space: nowrap; text-align: left;">第 ${r} 轮 <span style="font-weight: normal; font-size: 11px; color: var(--text-muted); margin-left: 4px;">${timeStr}</span></td>`;
+                tr.innerHTML = `<td style="font-weight: bold; font-size: 12.5px; color: var(--text-color); padding-right: 12px; white-space: nowrap; text-align: left;">第 ${r} 轮<span style="font-weight: normal; font-size: 11px; color: ${liveState ? 'var(--info)' : 'var(--text-muted)'}; margin-left: 4px;">${liveTag}${timeStr}</span></td>`;
 
 
 
@@ -4352,25 +4465,7 @@ function renderRoundMatrix() {
 
                         activeCount++;
 
-                        if (r === currentRoundNum) {
-
-                            if (runResults[q.id]) {
-
-                                status = runResults[q.id].status;
-
-                            }
-
-                        } else if (r < currentRoundNum) {
-
-                            const rData = multiRoundMatrix.find(item => item.roundNum === r);
-
-                            if (rData && rData.results) {
-
-                                status = rData.results[q.id] || 'pending';
-
-                            }
-
-                        }
+                        status = getRoundQuestionStatus(r, q.id);
 
                     }
 
@@ -4412,9 +4507,11 @@ function renderRoundMatrix() {
 
                     let elapsedStr = "";
 
-                    if (r === currentRoundNum && runResults[q.id] && runResults[q.id].elapsed) {
+                    const elapsedVal = getRoundQuestionElapsed(r, q.id);
 
-                        elapsedStr = ` (${runResults[q.id].elapsed}s)`;
+                    if (elapsedVal) {
+
+                        elapsedStr = ` (${elapsedVal}s)`;
 
                     }
 
@@ -4422,15 +4519,13 @@ function renderRoundMatrix() {
 
 
 
-                    const cellId = r === currentRoundNum ? `id="heatmap-cell-${q.id}"` : '';
-
+                    // Concurrent rounds share the same question columns, so per-cell DOM ids
+                    // would collide across live rows; the full matrix is re-rendered on events.
                     tr.innerHTML += `
 
                         <td style="text-align:center;">
 
                             <div class="${cellClass}" 
-
-                                 ${cellId}
 
                                  title="${titleText}" 
 
@@ -4446,7 +4541,7 @@ function renderRoundMatrix() {
 
 
 
-                const scoreStr = (r <= currentRoundNum && activeCount > 0) ? `${correctCount}/${activeCount}` : '-';
+                const scoreStr = (isRoundStarted(r) && activeCount > 0) ? `${correctCount}/${activeCount}` : '-';
 
                 tr.innerHTML += `<td style="font-weight: bold; font-size: 13px; color: var(--success); padding-left: 12px; white-space: nowrap; text-align: right;">${scoreStr}</td>`;
 
@@ -4494,27 +4589,7 @@ function renderRoundMatrix() {
 
                 for (let r = 1; r <= totalRounds; r++) {
 
-                    let status = 'pending';
-
-                    if (r === currentRoundNum) {
-
-                        if (runResults[q.id]) {
-
-                            status = runResults[q.id].status;
-
-                        }
-
-                    } else if (r < currentRoundNum) {
-
-                        const rData = multiRoundMatrix.find(item => item.roundNum === r);
-
-                        if (rData && rData.results) {
-
-                            status = rData.results[q.id] || 'pending';
-
-                        }
-
-                    }
+                    const status = getRoundQuestionStatus(r, q.id);
 
 
 
@@ -4564,27 +4639,7 @@ function renderRoundMatrix() {
 
                     if (isSelected) {
 
-                        let status = 'pending';
-
-                        if (r === currentRoundNum) {
-
-                            if (runResults[q.id]) {
-
-                                status = runResults[q.id].status;
-
-                            }
-
-                        } else if (r < currentRoundNum) {
-
-                            const rData = multiRoundMatrix.find(item => item.roundNum === r);
-
-                            if (rData && rData.results) {
-
-                                status = rData.results[q.id] || 'pending';
-
-                            }
-
-                        }
+                        const status = getRoundQuestionStatus(r, q.id);
 
                         if (status === 'pass' || status === 'fail' || status === 'error') {
 
@@ -4986,6 +5041,12 @@ function renderRoundMatrix() {
 
             multiRoundMatrix = [];
 
+            roundStates = {};
+
+            globalPauseStart = 0;
+
+            currentRoundNum = 1;
+
             selectedQuestionId = null;
 
             selectedRoundNum = null;
@@ -5042,61 +5103,59 @@ function renderRoundMatrix() {
 
 
 
-            for (let r = 1; r <= totalRounds; r++) {
+            // ── 并发轮次执行器 ──────────────────────────────────────────────
+            // 多轮次不再串行：N 个轮次作为 N 条并发流同时向 LLM 发起测试，
+            // 每条流内部仍按题目顺序逐题执行。任一轮先完成即独立归档并落盘
+            // trace，轮与轮之间不再有序间休息等待。
+            questionsList.forEach(q => {
 
-                if (abortController.signal.aborted) break;
+                if (selectedQuestionIds.has(q.id)) {
 
+                    updateQuestionCardStatus(q.id, 'pending');
 
+                } else {
 
-                currentRoundNum = r;
+                    updateQuestionCardStatus(q.id, 'skipped');
 
-                currentRoundStartTime = performance.now();
+                }
 
-                totalPausedMs = 0;
+            });
 
-                roundPausedStartTime = 0;
+            updateStats();
 
+            updateProgress();
 
+            renderRoundMatrix();
 
-                // Clear runResults for the new round
+            updateDbStatus(`并发测试进行中 (${totalRounds} 轮并发 × ${selectedQuestionIds.size} 题)...`, 'status-green');
 
-                runResults = {};
+            const runRoundWorker = async (r) => {
 
+                const state = {
 
+                    roundNum: r,
 
-                // Reset statuses
+                    results: {},
 
-                questionsList.forEach(q => {
+                    startTime: performance.now(),
 
-                    if (selectedQuestionIds.has(q.id)) {
+                    pausedTotalMs: 0,
 
-                        updateQuestionCardStatus(q.id, 'pending');
+                    currentIndex: -1,
 
-                    } else {
+                    done: false
 
-                        updateQuestionCardStatus(q.id, 'skipped');
+                };
 
-                    }
+                roundStates[r] = state;
 
-                });
+                const results = state.results;
 
-                updateStats();
-
-                updateProgress(r, totalRounds);
-
-                renderRoundMatrix();
-
-
-
-                updateDbStatus(`正在进行测试中 (第 ${r}/${totalRounds} 轮)...`, 'status-green');
-
-
+                let workerCacheSaltFailure = null;
 
                 for (let i = 0; i < questionsList.length; i++) {
 
                     if (abortController.signal.aborted) break;
-
-
 
                     const q = questionsList[i];
 
@@ -5106,43 +5165,26 @@ function renderRoundMatrix() {
 
                     }
 
+                    // 题目边界处等待全局暂停恢复；暂停时长由暂停按钮统一
+                    // 记到各存活轮次的 pausedTotalMs，这里不再自行计时。
+                    while (benchmarkPaused && !abortController.signal.aborted) {
 
+                        updateDbStatus("测试已暂停，等待继续...", "status-yellow");
 
-                    // Check if paused
-
-                    if (benchmarkPaused && !abortController.signal.aborted) {
-
-                        const pauseStart = performance.now();
-
-                        while (benchmarkPaused && !abortController.signal.aborted) {
-
-                            updateDbStatus("测试已暂停，等待继续...", "status-yellow");
-
-                            await new Promise(resolve => setTimeout(resolve, 500));
-
-                        }
-
-                        totalPausedMs += (performance.now() - pauseStart);
+                        await new Promise(resolve => setTimeout(resolve, 500));
 
                     }
 
                     if (abortController.signal.aborted) break;
 
                     // One salt defines one question session. Agent turns and no-tool-call
-
                     // retries reuse it; the next question receives a new cache namespace.
-
                     const questionCacheSalt = cacheSaltEachQuestion ? createQuestionCacheSalt() : null;
 
+                    state.currentIndex = i;
 
-
-                    currentQuestionIndex = i;
-
-
-
-                    // Initialize results state
-
-                    runResults[q.id] = {
+                    // Initialize results state for this round's copy of the question
+                    results[q.id] = {
 
                         id: q.id,
 
@@ -5170,23 +5212,23 @@ function renderRoundMatrix() {
 
                     };
 
+                    refreshQuestionCard(q.id);
 
+                    updateProgress();
 
-                    updateQuestionCardStatus(q.id, 'running');
+                    if (autoScrollInspector && getFollowRound() === r) {
 
-                    updateProgress(r, totalRounds, q.id, 1);
+                        selectQuestion(q.id, false, r); // auto select running question
 
-                    if (autoScrollInspector) selectQuestion(q.id, false, r); // auto select running question
+                    }
 
                     renderRoundMatrix();
-
-
 
                     const logFn = (msg, level) => {
 
                         const time = new Date().toLocaleTimeString();
 
-                        runResults[q.id].logs.push({ time, msg, level });
+                        results[q.id].logs.push({ time, msg, level });
 
                         if (selectedQuestionId === q.id && selectedRoundNum === r) {
 
@@ -5196,11 +5238,9 @@ function renderRoundMatrix() {
 
                     };
 
-
-
                     const stepResultFn = (stepRecord) => {
 
-                        runResults[q.id].history.push(stepRecord);
+                        results[q.id].history.push(stepRecord);
 
                         if (selectedQuestionId === q.id && selectedRoundNum === r) {
 
@@ -5210,17 +5250,13 @@ function renderRoundMatrix() {
 
                     };
 
-
-
-                    logFn(`开始基准测试问题 Q${q.id}...`, 'info');
+                    logFn(`开始基准测试问题 Q${q.id} (第 ${r} 轮)...`, 'info');
 
                     if (questionCacheSalt) {
 
                         logFn("已启用 vLLM cache_salt 题间隔离。", "info");
 
                     }
-
-
 
                     const qStart = performance.now();
 
@@ -5254,29 +5290,23 @@ function renderRoundMatrix() {
 
                             (attempts) => {
 
-                                runResults[q.id].attempts = attempts;
+                                results[q.id].attempts = attempts;
 
-                                updateProgress(r, totalRounds, q.id, attempts);
+                                updateProgress();
 
                             }
 
                         );
 
-
-
                         const qDurationMs = performance.now() - qStart;
 
-                        runResults[q.id].durationMs = qDurationMs;
+                        results[q.id].durationMs = qDurationMs;
 
-                        runResults[q.id].elapsed = (qDurationMs / 1000).toFixed(2);
-
-
+                        results[q.id].elapsed = (qDurationMs / 1000).toFixed(2);
 
                         let status = 'fail';
 
                         let check = null;
-
-
 
                         if (run.error) {
 
@@ -5294,59 +5324,55 @@ function renderRoundMatrix() {
 
                         }
 
+                        results[q.id].status = status;
 
-
-                        runResults[q.id].status = status;
-
-                        runResults[q.id].generatedSql = run.generatedSql || '';
+                        results[q.id].generatedSql = run.generatedSql || '';
 
                         // Preserve the exact result that was scored. The inspector must
                         // never execute model SQL a second time just to render a preview.
-                        runResults[q.id].queryResult = run.queryResult || null;
+                        results[q.id].queryResult = run.queryResult || null;
 
-                        runResults[q.id].attempts = run.attempts;
+                        results[q.id].attempts = run.attempts;
 
-                        runResults[q.id].inputTokens = run.inputTokens;
+                        results[q.id].inputTokens = run.inputTokens;
 
-                        runResults[q.id].outputTokens = run.outputTokens;
+                        results[q.id].outputTokens = run.outputTokens;
 
-                        runResults[q.id].error = run.error || '';
+                        results[q.id].error = run.error || '';
 
-                        runResults[q.id].check = check;
-
-
-
-                        updateQuestionCardStatus(q.id, status);
+                        results[q.id].check = check;
 
                     } catch (err) {
 
                         const qDurationMs = performance.now() - qStart;
 
-                        runResults[q.id].durationMs = qDurationMs;
+                        results[q.id].durationMs = qDurationMs;
 
-                        runResults[q.id].elapsed = (qDurationMs / 1000).toFixed(2);
+                        results[q.id].elapsed = (qDurationMs / 1000).toFixed(2);
 
                         if (err.code === "CACHE_SALT_UNSUPPORTED") {
 
-                            runResults[q.id].status = 'error';
+                            results[q.id].status = 'error';
 
-                            runResults[q.id].error = err.message;
-
-                            updateQuestionCardStatus(q.id, 'error');
+                            results[q.id].error = err.message;
 
                             logFn(`致命错误: ${err.message}`, 'danger');
 
-                            cacheSaltFailure = `第 ${r} 轮 Q${q.id}: API不支持vLLM cache_salt，请关闭“Auto Reset Prefix cache”后重试。`;
+                            if (!cacheSaltFailure) {
 
-                            alert(`${cacheSaltFailure}\n\n${err.message}`);
+                                workerCacheSaltFailure = `第 ${r} 轮 Q${q.id}: API不支持vLLM cache_salt，请关闭“Auto Reset Prefix cache”后重试。`;
 
-                            abortController.abort();
+                                cacheSaltFailure = workerCacheSaltFailure;
+
+                                alert(`${workerCacheSaltFailure}\n\n${err.message}`);
+
+                                abortController.abort();
+
+                            }
 
                         } else if (err.message === "Aborted" || abortController.signal.aborted) {
 
-                            runResults[q.id].status = 'pending';
-
-                            updateQuestionCardStatus(q.id, 'pending');
+                            results[q.id].status = 'pending';
 
                             logFn("测试已被用户手动终止。", "warning");
 
@@ -5356,11 +5382,9 @@ function renderRoundMatrix() {
 
                             console.error(err);
 
-                            runResults[q.id].status = 'error';
+                            results[q.id].status = 'error';
 
-                            runResults[q.id].error = err.message;
-
-                            updateQuestionCardStatus(q.id, 'error');
+                            results[q.id].error = err.message;
 
                             logFn(`致命错误: ${err.message}`, 'danger');
 
@@ -5368,17 +5392,15 @@ function renderRoundMatrix() {
 
                     }
 
-
+                    refreshQuestionCard(q.id);
 
                     updateStats();
 
-                    updateProgress(r, totalRounds);
+                    updateProgress();
 
                     renderRoundMatrix();
 
-
-
-                    if (autoScrollInspector) {
+                    if (autoScrollInspector && getFollowRound() === r) {
 
                         selectQuestion(q.id, false, r);
 
@@ -5386,14 +5408,9 @@ function renderRoundMatrix() {
 
                 }
 
+                const abortedRun = abortController.signal.aborted;
 
-
-                if (abortController.signal.aborted) break;
-
-
-
-                // Capture the results of this round and push to history matrix
-
+                // Archive this round (full or partial-on-stop) into the history matrix.
                 const roundRecord = {
 
                     roundNum: r,
@@ -5402,7 +5419,7 @@ function renderRoundMatrix() {
 
                     details: {},
 
-                    totalDurationMs: currentRoundStartTime > 0 ? (performance.now() - currentRoundStartTime - totalPausedMs) : 0
+                    totalDurationMs: Math.max(0, performance.now() - state.startTime - state.pausedTotalMs)
 
                 };
 
@@ -5410,11 +5427,21 @@ function renderRoundMatrix() {
 
                     if (selectedQuestionIds.has(q.id)) {
 
-                        roundRecord.results[q.id] = runResults[q.id].status;
+                        const res = results[q.id];
 
-                        // Keep the completed round's full inspector data before runResults
-                        // is replaced at the start of the next round.
-                        roundRecord.details[q.id] = cloneQuestionResult(runResults[q.id]);
+                        if (res) {
+
+                            roundRecord.results[q.id] = res.status;
+
+                            // Keep the completed round's full inspector data before the
+                            // live state is dropped below.
+                            roundRecord.details[q.id] = cloneQuestionResult(res);
+
+                        } else {
+
+                            roundRecord.results[q.id] = 'pending';
+
+                        }
 
                     } else {
 
@@ -5426,53 +5453,50 @@ function renderRoundMatrix() {
 
                 multiRoundMatrix.push(roundRecord);
 
+                multiRoundMatrix.sort((a, b) => a.roundNum - b.roundNum);
+
+                state.done = true;
+
+                delete roundStates[r];
+
                 renderRoundMatrix();
 
+                updateStats();
 
+                updateProgress();
 
-                // Automatically save trace to local CSV on round completion
+                if (!abortedRun) {
 
-                await saveTraceToServer(false, r, totalRounds);
+                    // Automatically save trace to server as soon as this round finishes.
+                    await saveTraceToServer(false, r, totalRounds, results);
 
+                    const liveLeft = countLiveRounds();
 
+                    if (liveLeft > 0) {
 
-                if (r < totalRounds) {
-
-                    let timeLeft = 5;
-
-                    while (timeLeft > 0 && !abortController.signal.aborted) {
-
-                        if (benchmarkPaused && !abortController.signal.aborted) {
-
-                            while (benchmarkPaused && !abortController.signal.aborted) {
-
-                                updateDbStatus("休息已暂停，等待继续...", "status-yellow");
-
-                                await new Promise(resolve => setTimeout(resolve, 500));
-
-                            }
-
-                        }
-
-                        if (abortController.signal.aborted) break;
-
-                        updateDbStatus(`第 ${r}/${totalRounds} 轮已完，休息等待下一轮 (${timeLeft}秒)...`, 'status-yellow');
-
-                        try {
-
-                            await delayWithAbort(1000, abortController.signal);
-
-                        } catch(e) {
-
-                            break;
-
-                        }
-
-                        timeLeft--;
+                        updateDbStatus(`第 ${r} 轮已完成，剩余并发流 ${liveLeft} 路...`, 'status-yellow');
 
                     }
 
                 }
+
+                return workerCacheSaltFailure;
+
+            };
+
+            const roundWorkerPromises = [];
+
+            for (let r = 1; r <= totalRounds; r++) {
+
+                roundWorkerPromises.push(runRoundWorker(r));
+
+            }
+
+            const workerFailures = await Promise.all(roundWorkerPromises);
+
+            if (!cacheSaltFailure) {
+
+                cacheSaltFailure = workerFailures.find(msg => msg) || null;
 
             }
 
@@ -5568,6 +5592,10 @@ function renderRoundMatrix() {
 
             benchmarkPaused = false;
 
+            // If the run was stopped while paused, credit the pending pause window to
+            // every still-live round before the workers archive their partial results.
+            creditPauseToLiveRounds();
+
             document.getElementById('btn-pause').style.display = 'none';
 
             document.getElementById('btn-save-trace').disabled = false;
@@ -5590,13 +5618,13 @@ function renderRoundMatrix() {
 
             stopBenchmark();
 
-            runResults = {};
+            roundStates = {};
+
+            globalPauseStart = 0;
 
             multiRoundMatrix = [];
 
             currentRoundNum = 1;
-
-            currentQuestionIndex = 0;
 
             selectedQuestionId = null;
 
@@ -5846,7 +5874,7 @@ function renderRoundMatrix() {
 
                     updateDbStatus("测试已暂停，等待继续...", "status-yellow");
 
-                    roundPausedStartTime = performance.now();
+                    globalPauseStart = performance.now();
 
                 } else {
 
@@ -5854,17 +5882,11 @@ function renderRoundMatrix() {
 
                     pauseSvg.innerHTML = '<path d="M6 4h4v16H6zM14 4h4v16h-4z"></path>';
 
-                    const totalRounds = parseInt(document.getElementById('api-rounds').value.trim(), 10) || 1;
+                    const plannedRounds = parseInt(document.getElementById('api-rounds').value.trim(), 10) || 1;
 
-                    updateDbStatus(`正在进行测试中 (第 ${currentRoundNum}/${totalRounds} 轮)...`, 'status-green');
+                    creditPauseToLiveRounds();
 
-                    if (roundPausedStartTime > 0) {
-
-                        totalPausedMs += (performance.now() - roundPausedStartTime);
-
-                        roundPausedStartTime = 0;
-
-                    }
+                    updateDbStatus(`并发测试恢复 (${countLiveRounds()}/${plannedRounds} 轮进行中)...`, 'status-green');
 
                 }
 
@@ -5969,15 +5991,11 @@ function renderRoundMatrix() {
 
             const statusEl = document.getElementById(`q-status-${id}`);
 
-            const cellEl = document.getElementById(`heatmap-cell-${id}`);
-
             const qCard = document.getElementById(`q-card-${id}`);
 
 
 
             if (statusEl) statusEl.className = 'status-badge';
-
-            if (cellEl) cellEl.className = 'matrix-cell';
 
 
 
@@ -5991,7 +6009,6 @@ function renderRoundMatrix() {
 
                 }
 
-                if (cellEl) cellEl.classList.add('pending');
 
                 if (qCard) qCard.className = 'question-card';
 
@@ -6005,7 +6022,6 @@ function renderRoundMatrix() {
 
                 }
 
-                if (cellEl) cellEl.classList.add('skipped');
 
                 if (qCard) qCard.className = 'question-card disabled';
 
@@ -6019,7 +6035,6 @@ function renderRoundMatrix() {
 
                 }
 
-                if (cellEl) cellEl.classList.add('running');
 
                 if (qCard) qCard.className = 'question-card active';
 
@@ -6033,7 +6048,6 @@ function renderRoundMatrix() {
 
                 }
 
-                if (cellEl) cellEl.classList.add('pass');
 
                 if (qCard) qCard.className = 'question-card';
 
@@ -6047,7 +6061,6 @@ function renderRoundMatrix() {
 
                 }
 
-                if (cellEl) cellEl.classList.add('fail');
 
                 if (qCard) qCard.className = 'question-card';
 
@@ -6061,7 +6074,6 @@ function renderRoundMatrix() {
 
                 }
 
-                if (cellEl) cellEl.classList.add('error');
 
                 if (qCard) qCard.className = 'question-card';
 
@@ -6073,63 +6085,65 @@ function renderRoundMatrix() {
 
         function updateProgress(roundNum = null, totalRounds = null, runningQId = null, attemptNum = null, terminalText = '') {
 
-            const activeQuestionsCount = selectedQuestionIds.size;
+            // Concurrent rounds: progress is aggregated over question-runs
+            // (totalRounds × selected questions), not a single live round. The old
+            // roundNum/runningQId/attemptNum arguments are kept for call-site
+            // compatibility but no longer drive the rendering.
+            const plannedRounds = parseInt(document.getElementById('api-rounds').value.trim(), 10) || 1;
 
-            const completed = Object.values(runResults).filter(r => r.status !== 'running' && r.status !== 'pending' && r.status !== 'skipped').length;
+            const perRoundCount = selectedQuestionIds.size;
 
+            let completedRuns = 0;
 
+            let runningRuns = 0;
 
-            let roundTextVal = "第 1 / 1 轮";
+            forEachCompletedRun(r => {
 
-            if (roundNum && totalRounds) {
+                if (r.status === 'running') runningRuns++;
 
-                roundTextVal = `第 ${roundNum} / ${totalRounds} 轮`;
+                else if (r.status !== 'pending' && r.status !== 'skipped') completedRuns++;
 
-            }
+            });
+
+            let liveRounds = countLiveRounds();
+
+            const archivedRounds = multiRoundMatrix.length;
 
             const statRoundEl = document.getElementById('stat-round');
 
             if (statRoundEl) {
 
-                statRoundEl.innerText = roundTextVal;
+                if (benchmarkRunning) {
+
+                    statRoundEl.innerText = `并发 ${liveRounds} / ${plannedRounds} 轮`;
+
+                } else if (archivedRounds > 0) {
+
+                    statRoundEl.innerText = `完成 ${archivedRounds} / ${plannedRounds} 轮`;
+
+                } else {
+
+                    statRoundEl.innerText = "第 1 / 1 轮";
+
+                }
 
             }
-
-
-
-            let roundText = "";
-
-            if (roundNum && totalRounds) {
-
-                roundText = `Round ${roundNum}/${totalRounds}: `;
-
-            }
-
-
 
             let runningText = "";
 
             // A late async attempt callback may arrive after stopBenchmark() has aborted
             // the run; never let it restore a stale Running label.
-            if (runningQId && benchmarkRunning) {
+            if (benchmarkRunning && runningRuns > 0) {
 
-                runningText = ` | Running Q${runningQId}`;
-
-                if (attemptNum) {
-
-                    runningText += ` (<strong>attempt ${attemptNum}</strong>)`;
-
-                }
-
-                runningText += "...";
+                runningText = ` | ${runningRuns} 路请求在途`;
 
             }
 
             const terminalStatusText = terminalText ? ` | ${terminalText}` : "";
 
+            const totalRuns = plannedRounds * perRoundCount;
 
-
-            document.getElementById('run-progress-text').innerHTML = `${roundText}${completed} / ${activeQuestionsCount} completed${runningText}${terminalStatusText}`;
+            document.getElementById('run-progress-text').innerHTML = `${completedRuns} / ${totalRuns} completed${runningText}${terminalStatusText}`;
 
         }
 
@@ -6137,15 +6151,17 @@ function renderRoundMatrix() {
 
         function updateStats() {
 
-            const results = Object.values(runResults);
+            let passed = 0, failed = 0, errored = 0;
 
-            const passed = results.filter(r => r.status === 'pass').length;
+            forEachCompletedRun(r => {
 
-            const failed = results.filter(r => r.status === 'fail').length;
+                if (r.status === 'pass') passed++;
 
-            const errored = results.filter(r => r.status === 'error').length;
+                else if (r.status === 'fail') failed++;
 
+                else if (r.status === 'error') errored++;
 
+            });
 
             document.getElementById('stat-passed').innerText = passed;
 
@@ -6160,7 +6176,6 @@ function renderRoundMatrix() {
 
         function toggleAutoScroll() {
             autoScrollInspector = !autoScrollInspector;
-            console.log('[AutoScroll] toggleAutoScroll called, autoScrollInspector =', autoScrollInspector, 'benchmarkRunning =', benchmarkRunning, 'currentQuestionIndex =', currentQuestionIndex);
             updateAutoScrollButton();
             if (autoScrollInspector) {
                 // Resuming follow mode removes the manual heatmap focus ring.
@@ -6168,12 +6183,13 @@ function renderRoundMatrix() {
                 renderRoundMatrix();
             }
             if (autoScrollInspector && benchmarkRunning && !benchmarkPaused) {
-                // Resume: jump to the currently running question
-                if (currentQuestionIndex >= 0 && currentQuestionIndex < questionsList.length) {
-                    const currentQ = questionsList[currentQuestionIndex];
+                // Resume: jump to the currently running question of the follow round
+                const followRound = getFollowRound();
+                const state = followRound !== null ? roundStates[followRound] : null;
+                if (state && state.currentIndex >= 0 && state.currentIndex < questionsList.length) {
+                    const currentQ = questionsList[state.currentIndex];
                     if (currentQ) {
-                        console.log('[AutoScroll] Resuming to question', currentQ.id);
-                        selectQuestion(currentQ.id, false, currentRoundNum);
+                        selectQuestion(currentQ.id, false, followRound);
                     }
                 }
             }
@@ -6230,8 +6246,9 @@ function renderRoundMatrix() {
 
 
         function getQuestionResult(id, roundNum) {
-            if (roundNum === currentRoundNum && runResults[id]) {
-                return runResults[id];
+            const live = getLiveRoundState(roundNum);
+            if (live && live.results[id]) {
+                return live.results[id];
             }
 
             const archivedRound = multiRoundMatrix.find(item => item.roundNum === roundNum);
@@ -6246,6 +6263,9 @@ function renderRoundMatrix() {
             const targetRound = Number.isFinite(Number(roundNum)) ? Number(roundNum) : currentRoundNum;
             selectedQuestionId = id;
             selectedRoundNum = targetRound;
+            // The inspector focus doubles as the default round for round-less selects
+            // (question card clicks, summary row clicks).
+            currentRoundNum = targetRound;
             highlightedHeatmapCell = highlightCell ? `${targetRound}:${id}` : null;
 
 
